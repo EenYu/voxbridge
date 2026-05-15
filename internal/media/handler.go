@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"voxbridge/internal/dialog"
+	"voxbridge/internal/playback"
 )
 
 const (
@@ -39,6 +40,7 @@ type Handler struct {
 	Upgrader websocket.Upgrader
 	Logger   *slog.Logger
 
+	PlaybackMode        playback.Mode
 	SampleRate          int
 	Channels            int
 	BytesPerSample      int
@@ -51,6 +53,7 @@ func NewHandler(factory SessionFactory) *Handler {
 		Upgrader: websocket.Upgrader{
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
+		PlaybackMode:        playback.ModeWSBinary,
 		SampleRate:          DefaultSampleRate,
 		Channels:            DefaultChannels,
 		BytesPerSample:      DefaultBytesPerSample,
@@ -99,7 +102,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 	}()
 
-	sender := newWebSocketAudioSender(conn, h.sampleRate(), h.chunkSize())
+	sender := newWebSocketAudioSender(conn, h.sampleRate(), h.chunkSize(), h.playbackMode())
 	var session DialogSession
 	defer func() {
 		if session != nil {
@@ -176,7 +179,18 @@ func (h *Handler) logger() *slog.Logger {
 }
 
 func (h *Handler) chunkSize() int {
-	return ChunkSizeBytes(h.SampleRate, h.Channels, h.BytesPerSample, h.TargetChunkDuration)
+	if h.playbackMode() == playback.ModeUUIDBroadcast {
+		return ChunkSizeBytes(h.SampleRate, h.Channels, h.BytesPerSample, h.TargetChunkDuration)
+	}
+	return BinaryChunkSizeBytes(h.SampleRate, h.Channels, h.BytesPerSample, h.TargetChunkDuration)
+}
+
+func (h *Handler) playbackMode() playback.Mode {
+	mode := playback.Normalize(h.PlaybackMode)
+	if !playback.IsValid(mode) {
+		return playback.ModeWSBinary
+	}
+	return mode
 }
 
 func callUUIDFromQuery(r *http.Request) string {
@@ -329,17 +343,21 @@ func (s *inboundAudioStats) shouldLog(now time.Time) bool {
 }
 
 type webSocketAudioSender struct {
-	conn       *websocket.Conn
-	sampleRate int
-	chunkSize  int
-	writeMu    sync.Mutex
+	conn         *websocket.Conn
+	sampleRate   int
+	chunkSize    int
+	playbackMode playback.Mode
+	writeMu      sync.Mutex
+	paceMu       sync.Mutex
+	nextWriteAt  time.Time
 }
 
-func newWebSocketAudioSender(conn *websocket.Conn, sampleRate, chunkSize int) *webSocketAudioSender {
+func newWebSocketAudioSender(conn *websocket.Conn, sampleRate, chunkSize int, playbackMode playback.Mode) *webSocketAudioSender {
 	return &webSocketAudioSender{
-		conn:       conn,
-		sampleRate: sampleRate,
-		chunkSize:  chunkSize,
+		conn:         conn,
+		sampleRate:   sampleRate,
+		chunkSize:    chunkSize,
+		playbackMode: playbackMode,
 	}
 }
 
@@ -350,6 +368,7 @@ func (s *webSocketAudioSender) SendPCM(ctx context.Context, pcm []byte) error {
 	if s.chunkSize <= 0 {
 		s.chunkSize = ChunkSizeBytes(s.sampleRate, DefaultChannels, DefaultBytesPerSample, DefaultChunkDuration)
 	}
+	paceWrites := playback.Normalize(s.playbackMode) == playback.ModeWSBinary
 
 	for start := 0; start < len(pcm); start += s.chunkSize {
 		if err := ctx.Err(); err != nil {
@@ -359,7 +378,12 @@ func (s *webSocketAudioSender) SendPCM(ctx context.Context, pcm []byte) error {
 		if end > len(pcm) {
 			end = len(pcm)
 		}
-		if err := s.writeJSON(newStreamAudioMessage(s.sampleRate, pcm[start:end])); err != nil {
+		if paceWrites {
+			if err := s.waitForWriteSlot(ctx, end-start); err != nil {
+				return err
+			}
+		}
+		if err := s.writePCMChunk(pcm[start:end]); err != nil {
 			return err
 		}
 	}
@@ -367,7 +391,45 @@ func (s *webSocketAudioSender) SendPCM(ctx context.Context, pcm []byte) error {
 }
 
 func (s *webSocketAudioSender) ClearQueued() {
+	s.resetPacing()
 	_ = s.writeJSON(newClearAudioMessage())
+}
+
+func (s *webSocketAudioSender) waitForWriteSlot(ctx context.Context, bytes int) error {
+	delay := s.reserveWriteDelay(time.Now(), bytes)
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *webSocketAudioSender) reserveWriteDelay(now time.Time, bytes int) time.Duration {
+	duration := pcmChunkDuration(s.sampleRate, bytes)
+
+	s.paceMu.Lock()
+	defer s.paceMu.Unlock()
+
+	target := s.nextWriteAt
+	if target.IsZero() || !target.After(now) {
+		target = now
+	}
+	s.nextWriteAt = target.Add(duration)
+	return target.Sub(now)
+}
+
+func (s *webSocketAudioSender) resetPacing() {
+	s.paceMu.Lock()
+	s.nextWriteAt = time.Time{}
+	s.paceMu.Unlock()
 }
 
 func (s *webSocketAudioSender) writeJSON(message any) error {
@@ -377,4 +439,31 @@ func (s *webSocketAudioSender) writeJSON(message any) error {
 		return errors.New("websocket connection is nil")
 	}
 	return s.conn.WriteJSON(message)
+}
+
+func (s *webSocketAudioSender) writePCMChunk(pcm []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.conn == nil {
+		return errors.New("websocket connection is nil")
+	}
+	if playback.Normalize(s.playbackMode) == playback.ModeUUIDBroadcast {
+		return s.conn.WriteJSON(newStreamAudioMessage(s.sampleRate, pcm))
+	}
+	return s.conn.WriteMessage(websocket.BinaryMessage, pcm)
+}
+
+func pcmChunkDuration(sampleRate, bytes int) time.Duration {
+	if sampleRate <= 0 {
+		sampleRate = DefaultSampleRate
+	}
+	if bytes <= 0 {
+		return 0
+	}
+
+	bytesPerSecond := sampleRate * DefaultChannels * DefaultBytesPerSample
+	if bytesPerSecond <= 0 {
+		return 0
+	}
+	return time.Duration(int64(bytes) * int64(time.Second) / int64(bytesPerSecond))
 }

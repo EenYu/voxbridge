@@ -19,6 +19,7 @@ import (
 	"voxbridge/internal/freeswitch"
 	"voxbridge/internal/llm"
 	"voxbridge/internal/media"
+	"voxbridge/internal/playback"
 	"voxbridge/internal/speech"
 	"voxbridge/internal/speech/volcengine"
 )
@@ -98,6 +99,7 @@ func run(logger *slog.Logger) error {
 		Address:               cfg.ESL.Address,
 		Password:              cfg.ESL.Password,
 		PublicWSURL:           cfg.PublicWS.URL,
+		PlaybackMode:          cfg.PlaybackMode,
 		RequiredVariableName:  "voxbridge_enabled",
 		RequiredVariableValue: "true",
 	}, logger)
@@ -108,7 +110,7 @@ func run(logger *slog.Logger) error {
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	registry := newSessionRegistry(stt, tts, chat, fsClient, cfg.Audio.SampleRateHz, logger)
+	registry := newSessionRegistry(stt, tts, chat, fsClient, cfg.Audio.SampleRateHz, cfg.PlaybackMode, logger)
 	mediaHandler := media.NewHandler(func(ctx context.Context, info media.ConnectionInfo, sender dialog.AudioSender) (media.DialogSession, error) {
 		logger.Info("media session requested", "uuid", info.CallUUID)
 		session, err := registry.New(ctx, info, sender)
@@ -118,8 +120,10 @@ func run(logger *slog.Logger) error {
 		}
 		return session, nil
 	})
+	mediaHandler.PlaybackMode = cfg.PlaybackMode
 	mediaHandler.SampleRate = cfg.Audio.SampleRateHz
 	mediaHandler.Channels = cfg.Audio.Channels
+	mediaHandler.TargetChunkDuration = time.Duration(cfg.Audio.FrameMS) * time.Millisecond
 	mediaHandler.Logger = logger
 
 	mux := http.NewServeMux()
@@ -173,22 +177,26 @@ type sessionRegistry struct {
 	chat   llm.Client
 	fs     *freeswitch.Client
 	rate   int
+	mode   playback.Mode
 	logger *slog.Logger
 
-	mu       sync.Mutex
-	sessions map[string]*trackedSession
-	seq      int64
+	mu            sync.Mutex
+	sessions      map[string]*trackedSession
+	creationLocks map[string]*creationLock
+	seq           int64
 }
 
-func newSessionRegistry(stt speech.STTProvider, tts speech.TTSProvider, chat llm.Client, fsClient *freeswitch.Client, sampleRate int, logger *slog.Logger) *sessionRegistry {
+func newSessionRegistry(stt speech.STTProvider, tts speech.TTSProvider, chat llm.Client, fsClient *freeswitch.Client, sampleRate int, mode playback.Mode, logger *slog.Logger) *sessionRegistry {
 	return &sessionRegistry{
-		stt:      stt,
-		tts:      tts,
-		chat:     chat,
-		fs:       fsClient,
-		rate:     sampleRate,
-		logger:   logger,
-		sessions: make(map[string]*trackedSession),
+		stt:           stt,
+		tts:           tts,
+		chat:          chat,
+		fs:            fsClient,
+		rate:          sampleRate,
+		mode:          mode,
+		logger:        logger,
+		sessions:      make(map[string]*trackedSession),
+		creationLocks: make(map[string]*creationLock),
 	}
 }
 
@@ -199,6 +207,9 @@ func (r *sessionRegistry) New(ctx context.Context, info media.ConnectionInfo, se
 	}
 	r.logger.Info("starting dialog session", "uuid", id)
 
+	lock := r.acquireCreationLock(id)
+	defer r.releaseCreationLock(id, lock)
+
 	r.mu.Lock()
 	existing := r.sessions[id]
 	r.mu.Unlock()
@@ -206,11 +217,7 @@ func (r *sessionRegistry) New(ctx context.Context, info media.ConnectionInfo, se
 		_ = existing.Close()
 	}
 
-	playbackSender := sender
-	if r.fs != nil && strings.TrimSpace(info.CallUUID) != "" {
-		playbackSender = newFreeSwitchAudioSender(r.fs, id, r.rate, r.logger)
-		r.logger.Info("using freeswitch playback sender", "uuid", id, "sample_rate", r.rate)
-	}
+	playbackSender := r.audioSenderFor(info, sender)
 
 	session, err := dialog.NewSession(ctx, id, r.stt, r.tts, r.chat, playbackSender, dialog.Options{Logger: r.logger})
 	if err != nil {
@@ -228,6 +235,45 @@ func (r *sessionRegistry) New(ctx context.Context, info media.ConnectionInfo, se
 	r.mu.Unlock()
 	r.logger.Info("media session created", "uuid", id)
 	return tracked, nil
+}
+
+func (r *sessionRegistry) audioSenderFor(info media.ConnectionInfo, sender dialog.AudioSender) dialog.AudioSender {
+	uuid := strings.TrimSpace(info.CallUUID)
+	if playback.Normalize(r.mode) == playback.ModeUUIDBroadcast && r.fs != nil && uuid != "" {
+		r.logger.Info("using freeswitch playback sender", "uuid", uuid, "sample_rate", r.rate)
+		return newFreeSwitchAudioSender(r.fs, uuid, r.rate, r.logger)
+	}
+	return sender
+}
+
+type creationLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (r *sessionRegistry) acquireCreationLock(id string) *creationLock {
+	r.mu.Lock()
+	lock := r.creationLocks[id]
+	if lock == nil {
+		lock = &creationLock{}
+		r.creationLocks[id] = lock
+	}
+	lock.refs++
+	r.mu.Unlock()
+
+	lock.mu.Lock()
+	return lock
+}
+
+func (r *sessionRegistry) releaseCreationLock(id string, lock *creationLock) {
+	lock.mu.Unlock()
+
+	r.mu.Lock()
+	lock.refs--
+	if lock.refs == 0 {
+		delete(r.creationLocks, id)
+	}
+	r.mu.Unlock()
 }
 
 func (r *sessionRegistry) CloseAll() {

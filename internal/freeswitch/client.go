@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"voxbridge/internal/playback"
 )
 
 const (
@@ -25,6 +27,7 @@ type Config struct {
 	Address               string
 	Password              string
 	PublicWSURL           string
+	PlaybackMode          playback.Mode
 	StartEvents           []string
 	RequiredVariableName  string
 	RequiredVariableValue string
@@ -48,6 +51,12 @@ func NewClient(cfg Config, logger *slog.Logger) (*Client, error) {
 	}
 	if strings.TrimSpace(cfg.PublicWSURL) == "" {
 		return nil, errors.New("freeswitch: missing public WebSocket URL")
+	}
+	if cfg.PlaybackMode == "" {
+		cfg.PlaybackMode = playback.ModeWSBinary
+	}
+	if !playback.IsValid(cfg.PlaybackMode) {
+		return nil, fmt.Errorf("freeswitch: invalid playback mode %q", cfg.PlaybackMode)
 	}
 	if cfg.ReconnectDelay <= 0 {
 		cfg.ReconnectDelay = defaultReconnectDelay
@@ -83,19 +92,10 @@ func (c *Client) StartAudioStream(ctx context.Context, uuid string, metadata map
 	if uuid == "" {
 		return errors.New("freeswitch: missing UUID")
 	}
-	if metadata == nil {
-		metadata = map[string]string{}
-	}
-	metadata["uuid"] = uuid
-	meta, err := json.Marshal(metadata)
+	cmd, err := c.buildStartAudioStreamCommand(uuid, metadata)
 	if err != nil {
 		return err
 	}
-	wsURL, err := withUUIDQuery(c.cfg.PublicWSURL, uuid)
-	if err != nil {
-		return err
-	}
-	cmd := fmt.Sprintf("api uuid_audio_stream %s start %s mono 16000 %s", uuid, wsURL, string(meta))
 	_, err = c.command(ctx, cmd)
 	return err
 }
@@ -105,8 +105,41 @@ func (c *Client) StopAudioStream(ctx context.Context, uuid string) error {
 	if uuid == "" {
 		return errors.New("freeswitch: missing UUID")
 	}
-	_, err := c.command(ctx, fmt.Sprintf("api uuid_audio_stream %s stop", uuid))
+	_, err := c.command(ctx, c.buildStopAudioStreamCommand(uuid))
 	return err
+}
+
+func (c *Client) buildStartAudioStreamCommand(uuid string, metadata map[string]string) (string, error) {
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	metadata["uuid"] = uuid
+	meta, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+
+	switch playback.Normalize(c.cfg.PlaybackMode) {
+	case playback.ModeUUIDBroadcast:
+		wsURL, err := withUUIDQuery(c.cfg.PublicWSURL, uuid)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("api uuid_audio_stream %s start %s mono 16000 %s", uuid, wsURL, string(meta)), nil
+	case playback.ModeWSBinary:
+		return fmt.Sprintf("api uuid_audio_duplex %s start %s mono 16000 %s", uuid, c.cfg.PublicWSURL, string(meta)), nil
+	default:
+		return "", fmt.Errorf("unsupported playback mode %q", c.cfg.PlaybackMode)
+	}
+}
+
+func (c *Client) buildStopAudioStreamCommand(uuid string) string {
+	switch playback.Normalize(c.cfg.PlaybackMode) {
+	case playback.ModeUUIDBroadcast:
+		return fmt.Sprintf("api uuid_audio_stream %s stop", uuid)
+	default:
+		return fmt.Sprintf("api uuid_audio_duplex %s stop", uuid)
+	}
 }
 
 func (c *Client) PlayAudio(ctx context.Context, uuid, file string) error {

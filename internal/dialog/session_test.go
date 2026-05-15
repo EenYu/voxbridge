@@ -311,20 +311,69 @@ func TestSessionSendsFragmentsInOrder(t *testing.T) {
 
 func TestShouldFlushTTS(t *testing.T) {
 	tests := []struct {
-		name string
-		text string
-		want bool
+		name     string
+		text     string
+		maxChars int
+		minChars int
+		want     bool
 	}{
-		{name: "punctuation", text: "好的。", want: true},
-		{name: "length", text: "一二三四五", want: true},
-		{name: "short", text: "你好", want: false},
+		{name: "sentence punctuation", text: "好的。", maxChars: 10, minChars: 6, want: true},
+		{name: "length", text: "一二三四五", maxChars: 5, minChars: 10, want: true},
+		{name: "short", text: "你好", maxChars: 10, minChars: 6, want: false},
+		{name: "short weak punctuation", text: "好的，", maxChars: 10, minChars: 6, want: false},
+		{name: "long weak punctuation", text: "这是一个较长的停顿，", maxChars: 20, minChars: 6, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldFlushTTS(tt.text, 5); got != tt.want {
+			if got := shouldFlushTTS(tt.text, tt.maxChars, tt.minChars); got != tt.want {
 				t.Fatalf("shouldFlushTTS()=%v want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTrimHistoryKeepsSystemPromptAndRecentUserTurns(t *testing.T) {
+	history := []llm.Message{
+		{Role: llm.RoleSystem, Content: "sys"},
+		{Role: llm.RoleUser, Content: "u1"},
+		{Role: llm.RoleAssistant, Content: "a1"},
+		{Role: llm.RoleUser, Content: "u2"},
+		{Role: llm.RoleAssistant, Content: "a2"},
+		{Role: llm.RoleUser, Content: "u3"},
+	}
+
+	got := trimHistory(history, 2)
+	want := []llm.Message{
+		{Role: llm.RoleSystem, Content: "sys"},
+		{Role: llm.RoleUser, Content: "u2"},
+		{Role: llm.RoleAssistant, Content: "a2"},
+		{Role: llm.RoleUser, Content: "u3"},
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("len(trimHistory()) = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("trimHistory()[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTurnMetricsMarkersAreIdempotent(t *testing.T) {
+	turn := newTurnMetrics(1)
+
+	if !turn.markLLMFirstToken() || turn.markLLMFirstToken() {
+		t.Fatal("markLLMFirstToken should only succeed once")
+	}
+	if !turn.markFirstFragment() || turn.markFirstFragment() {
+		t.Fatal("markFirstFragment should only succeed once")
+	}
+	if !turn.markTTSFirstAudio() || turn.markTTSFirstAudio() {
+		t.Fatal("markTTSFirstAudio should only succeed once")
+	}
+	if !turn.markFirstPlaybackQueued() || turn.markFirstPlaybackQueued() {
+		t.Fatal("markFirstPlaybackQueued should only succeed once")
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"voxbridge/internal/playback"
 )
 
 func TestLoadFromEnvValidatesAndAppliesDefaults(t *testing.T) {
@@ -53,6 +55,9 @@ func TestLoadFromEnvValidatesAndAppliesDefaults(t *testing.T) {
 	if cfg.Volcengine.STTAsyncForceToSpeechTime != 900 {
 		t.Fatalf("STT async force to speech time = %d", cfg.Volcengine.STTAsyncForceToSpeechTime)
 	}
+	if cfg.PlaybackMode != playback.ModeWSBinary {
+		t.Fatalf("playback mode = %q, want %q", cfg.PlaybackMode, playback.ModeWSBinary)
+	}
 }
 
 func TestLoadFromEnvDefaultsOptionalAudioAndTimeouts(t *testing.T) {
@@ -92,11 +97,39 @@ func TestLoadFromEnvDefaultsOptionalAudioAndTimeouts(t *testing.T) {
 	if cfg.Volcengine.STTAsyncForceToSpeechTime != defaultSTTAsyncForceToSpeechTime {
 		t.Fatalf("STT async force to speech time = %d", cfg.Volcengine.STTAsyncForceToSpeechTime)
 	}
+	if cfg.PlaybackMode != defaultPlaybackMode {
+		t.Fatalf("playback mode = %q, want %q", cfg.PlaybackMode, defaultPlaybackMode)
+	}
+}
+
+func TestLoadFromEnvAcceptsUUIDBroadcastPlaybackMode(t *testing.T) {
+	env := map[string]string{
+		"VOXBRIDGE_ESL_ADDRESS":                  "127.0.0.1:8021",
+		"VOXBRIDGE_ESL_PASSWORD":                 "ClueCon",
+		"VOXBRIDGE_PUBLIC_WS_URL":                "ws://localhost:8080/audio",
+		"VOXBRIDGE_PLAYBACK_MODE":                string(playback.ModeUUIDBroadcast),
+		"VOXBRIDGE_LLM_BASE_URL":                 "http://localhost:11434",
+		"VOXBRIDGE_LLM_API_KEY":                  "test-key",
+		"VOXBRIDGE_LLM_MODEL":                    "gpt-test",
+		"VOXBRIDGE_VOLCENGINE_ACCESS_KEY_ID":     "ak",
+		"VOXBRIDGE_VOLCENGINE_SECRET_ACCESS_KEY": "sk",
+		"VOXBRIDGE_VOLCENGINE_APP_ID":            "app",
+		"VOXBRIDGE_VOLCENGINE_RESOURCE_ID":       "resource",
+	}
+
+	cfg, err := LoadFromEnv(mapLookup(env))
+	if err != nil {
+		t.Fatalf("LoadFromEnv() error = %v", err)
+	}
+	if cfg.PlaybackMode != playback.ModeUUIDBroadcast {
+		t.Fatalf("playback mode = %q, want %q", cfg.PlaybackMode, playback.ModeUUIDBroadcast)
+	}
 }
 
 func TestLoadFromEnvReturnsValidationErrors(t *testing.T) {
 	env := map[string]string{
 		"VOXBRIDGE_PUBLIC_WS_URL":                             "https://example.com/audio",
+		"VOXBRIDGE_PLAYBACK_MODE":                             "bad-mode",
 		"VOXBRIDGE_LLM_BASE_URL":                              "ftp://example.com",
 		"VOXBRIDGE_AUDIO_SAMPLE_RATE_HZ":                      "-1",
 		"VOXBRIDGE_LLM_TIMEOUT":                               "bad-duration",
@@ -115,6 +148,7 @@ func TestLoadFromEnvReturnsValidationErrors(t *testing.T) {
 		"VOXBRIDGE_ESL_PASSWORD is required",
 		"VOXBRIDGE_LLM_MODEL is required",
 		"VOXBRIDGE_PUBLIC_WS_URL must use ws or wss",
+		"VOXBRIDGE_PLAYBACK_MODE must be one of",
 		"VOXBRIDGE_LLM_BASE_URL must use http or https",
 		"VOXBRIDGE_AUDIO_SAMPLE_RATE_HZ must be positive",
 		"VOXBRIDGE_LLM_TIMEOUT must be a positive duration",

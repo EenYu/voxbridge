@@ -8,12 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"voxbridge/internal/playback"
 )
 
 const (
 	defaultAudioSampleRateHz         = 16000
 	defaultAudioChannels             = 1
 	defaultAudioFrameMS              = 20
+	defaultPlaybackMode              = playback.ModeWSBinary
 	defaultLLMTimeout                = 60 * time.Second
 	defaultESLTimeout                = 5 * time.Second
 	defaultSpeechTimeout             = 30 * time.Second
@@ -22,13 +25,14 @@ const (
 )
 
 type Config struct {
-	HTTP       HTTPConfig
-	ESL        ESLConfig
-	PublicWS   PublicWSConfig
-	LLM        LLMConfig
-	Volcengine VolcengineConfig
-	Audio      AudioConfig
-	Timeouts   TimeoutConfig
+	HTTP         HTTPConfig
+	ESL          ESLConfig
+	PublicWS     PublicWSConfig
+	PlaybackMode playback.Mode
+	LLM          LLMConfig
+	Volcengine   VolcengineConfig
+	Audio        AudioConfig
+	Timeouts     TimeoutConfig
 }
 
 type HTTPConfig struct {
@@ -102,6 +106,7 @@ func LoadFromEnv(lookup func(string) (string, bool)) (Config, error) {
 		PublicWS: PublicWSConfig{
 			URL: get(lookup, "VOXBRIDGE_PUBLIC_WS_URL"),
 		},
+		PlaybackMode: playback.Mode(valueOrDefault(get(lookup, "VOXBRIDGE_PLAYBACK_MODE"), string(defaultPlaybackMode))),
 		LLM: LLMConfig{
 			BaseURL: get(lookup, "VOXBRIDGE_LLM_BASE_URL"),
 			APIKey:  get(lookup, "VOXBRIDGE_LLM_API_KEY"),
@@ -166,6 +171,7 @@ func (c Config) Validate() error {
 
 	validateHTTPURL(&errs, "VOXBRIDGE_LLM_BASE_URL", c.LLM.BaseURL)
 	validateWebSocketURL(&errs, "VOXBRIDGE_PUBLIC_WS_URL", c.PublicWS.URL)
+	validatePlaybackMode(&errs, "VOXBRIDGE_PLAYBACK_MODE", c.PlaybackMode)
 	validateOptionalWebSocketURL(&errs, "VOXBRIDGE_VOLCENGINE_STT_ENDPOINT", c.Volcengine.STTEndpoint)
 	validateOptionalWebSocketURL(&errs, "VOXBRIDGE_VOLCENGINE_TTS_ENDPOINT", c.Volcengine.TTSEndpoint)
 	positiveInt(&errs, "VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE", c.Volcengine.STTAsyncEndWindowSize)
@@ -255,6 +261,12 @@ func validateHTTPURL(errs *[]error, key, value string) {
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		*errs = append(*errs, fmt.Errorf("%s must use http or https", key))
+	}
+}
+
+func validatePlaybackMode(errs *[]error, key string, value playback.Mode) {
+	if !playback.IsValid(value) {
+		*errs = append(*errs, fmt.Errorf("%s must be one of %q or %q", key, playback.ModeUUIDBroadcast, playback.ModeWSBinary))
 	}
 }
 

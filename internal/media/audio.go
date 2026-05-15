@@ -6,18 +6,32 @@ import (
 )
 
 const (
-	DefaultSampleRate     = 16000
-	DefaultChannels       = 1
-	DefaultBytesPerSample = 2
-	DefaultChunkDuration  = 150 * time.Millisecond
-	MinChunkDuration      = 100 * time.Millisecond
-	MaxChunkDuration      = 200 * time.Millisecond
+	DefaultSampleRate          = 16000
+	DefaultChannels            = 1
+	DefaultBytesPerSample      = 2
+	DefaultChunkDuration       = 150 * time.Millisecond
+	MinChunkDuration           = 100 * time.Millisecond
+	MaxChunkDuration           = 200 * time.Millisecond
+	DefaultBinaryChunkDuration = 20 * time.Millisecond
+	MinBinaryChunkDuration     = 20 * time.Millisecond
+	MaxBinaryChunkDuration     = 100 * time.Millisecond
 )
 
 // ChunkSizeBytes returns a PCM chunk size aligned to a complete audio frame.
 // The requested duration is clamped to the 100-200ms range expected by the
 // FreeSWITCH media websocket path.
 func ChunkSizeBytes(sampleRate, channels, bytesPerSample int, target time.Duration) int {
+	return boundedChunkSizeBytes(sampleRate, channels, bytesPerSample, target, DefaultChunkDuration, MinChunkDuration, MaxChunkDuration)
+}
+
+// BinaryChunkSizeBytes returns a raw PCM chunk size for ws_binary playback.
+// The requested duration is clamped to the 20-100ms range expected by
+// mod_audio_duplex.
+func BinaryChunkSizeBytes(sampleRate, channels, bytesPerSample int, target time.Duration) int {
+	return boundedChunkSizeBytes(sampleRate, channels, bytesPerSample, target, DefaultBinaryChunkDuration, MinBinaryChunkDuration, MaxBinaryChunkDuration)
+}
+
+func boundedChunkSizeBytes(sampleRate, channels, bytesPerSample int, target, fallback, min, max time.Duration) int {
 	if sampleRate <= 0 {
 		sampleRate = DefaultSampleRate
 	}
@@ -28,13 +42,13 @@ func ChunkSizeBytes(sampleRate, channels, bytesPerSample int, target time.Durati
 		bytesPerSample = DefaultBytesPerSample
 	}
 	if target <= 0 {
-		target = DefaultChunkDuration
+		target = fallback
 	}
-	if target < MinChunkDuration {
-		target = MinChunkDuration
+	if target < min {
+		target = min
 	}
-	if target > MaxChunkDuration {
-		target = MaxChunkDuration
+	if target > max {
+		target = max
 	}
 
 	frameSize := channels * bytesPerSample

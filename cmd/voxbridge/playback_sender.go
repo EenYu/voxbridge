@@ -18,6 +18,7 @@ import (
 const playbackFileTTL = 2 * time.Minute
 const playbackSampleRate = 16000
 
+// freeSwitchAudioSender is the fallback playback path for uuid_broadcast mode.
 type freeSwitchAudioSender struct {
 	client     *freeswitch.Client
 	uuid       string

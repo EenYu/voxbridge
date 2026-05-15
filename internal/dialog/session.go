@@ -16,14 +16,18 @@ import (
 
 const (
 	defaultSystemPrompt         = "你是一名简洁、礼貌、可靠的中文电话助手。回答要短，优先直接解决来电者的问题。"
+	defaultHistoryTurns         = 6
 	defaultMaxTTSChars          = 80
-	defaultTTSPlaybackChunkMS   = 2000
+	defaultMinTTSChars          = 12
+	defaultTTSPlaybackChunkMS   = 100
 	defaultTTSPlaybackChunkSize = 16000 * 2 * defaultTTSPlaybackChunkMS / 1000
 )
 
 type Options struct {
 	SystemPrompt string
+	HistoryTurns int
 	MaxTTSChars  int
+	MinTTSChars  int
 	Logger       *slog.Logger
 }
 
@@ -63,8 +67,14 @@ func NewSession(ctx context.Context, id string, sttProvider speech.STTProvider, 
 	if strings.TrimSpace(opts.SystemPrompt) == "" {
 		opts.SystemPrompt = defaultSystemPrompt
 	}
+	if opts.HistoryTurns <= 0 {
+		opts.HistoryTurns = defaultHistoryTurns
+	}
 	if opts.MaxTTSChars <= 0 {
 		opts.MaxTTSChars = defaultMaxTTSChars
+	}
+	if opts.MinTTSChars <= 0 {
+		opts.MinTTSChars = defaultMinTTSChars
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -174,7 +184,7 @@ func (s *Session) startUserTurn(text string) {
 		return
 	}
 	s.cancelActiveLocked()
-	s.history = append(s.history, llm.Message{Role: llm.RoleUser, Content: text})
+	s.history = trimHistory(append(s.history, llm.Message{Role: llm.RoleUser, Content: text}), s.opts.HistoryTurns)
 	messages := append([]llm.Message(nil), s.history...)
 	ctx, cancel := context.WithCancel(s.ctx)
 	s.responseSerial++
@@ -300,7 +310,7 @@ func (s *Session) runAssistant(ctx context.Context, serial int64, messages []llm
 				assistant.WriteString(delta.Content)
 				speechBuf.WriteString(delta.Content)
 			}
-			if delta.Done || shouldFlushTTS(speechBuf.String(), s.opts.MaxTTSChars) {
+			if delta.Done || shouldFlushTTS(speechBuf.String(), s.opts.MaxTTSChars, s.opts.MinTTSChars) {
 				if !flush() {
 					return
 				}
@@ -344,7 +354,7 @@ func (s *Session) runAssistant(ctx context.Context, serial int64, messages []llm
 	turn.logSummary(s.opts.Logger, s.id)
 	s.mu.Lock()
 	if s.responseSerial == serial && !s.closed {
-		s.history = append(s.history, llm.Message{Role: llm.RoleAssistant, Content: text})
+		s.history = trimHistory(append(s.history, llm.Message{Role: llm.RoleAssistant, Content: text}), s.opts.HistoryTurns)
 	}
 	s.mu.Unlock()
 }
@@ -557,7 +567,14 @@ type turnMetrics struct {
 }
 
 func newTurnMetrics(id int64) *turnMetrics {
-	return &turnMetrics{id: id, start: time.Now()}
+	return &turnMetrics{
+		id:                    id,
+		start:                 time.Now(),
+		llmFirstTokenMS:       -1,
+		firstFragmentMS:       -1,
+		ttsFirstAudioMS:       -1,
+		firstPlaybackQueuedMS: -1,
+	}
 }
 
 func (m *turnMetrics) elapsedMS() int64 {
@@ -567,7 +584,7 @@ func (m *turnMetrics) elapsedMS() int64 {
 func (m *turnMetrics) markLLMFirstToken() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.llmFirstTokenMS > 0 {
+	if m.llmFirstTokenMS >= 0 {
 		return false
 	}
 	m.llmFirstTokenMS = m.elapsedMS()
@@ -577,7 +594,7 @@ func (m *turnMetrics) markLLMFirstToken() bool {
 func (m *turnMetrics) markFirstFragment() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.firstFragmentMS > 0 {
+	if m.firstFragmentMS >= 0 {
 		return false
 	}
 	m.firstFragmentMS = m.elapsedMS()
@@ -587,7 +604,7 @@ func (m *turnMetrics) markFirstFragment() bool {
 func (m *turnMetrics) markTTSFirstAudio() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.ttsFirstAudioMS > 0 {
+	if m.ttsFirstAudioMS >= 0 {
 		return false
 	}
 	m.ttsFirstAudioMS = m.elapsedMS()
@@ -597,7 +614,7 @@ func (m *turnMetrics) markTTSFirstAudio() bool {
 func (m *turnMetrics) markFirstPlaybackQueued() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.firstPlaybackQueuedMS > 0 {
+	if m.firstPlaybackQueuedMS >= 0 {
 		return false
 	}
 	m.firstPlaybackQueuedMS = m.elapsedMS()
@@ -672,15 +689,55 @@ func previewText(text string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "..."
 }
 
-func shouldFlushTTS(text string, maxChars int) bool {
+func trimHistory(history []llm.Message, historyTurns int) []llm.Message {
+	if len(history) == 0 || historyTurns <= 0 {
+		return append([]llm.Message(nil), history...)
+	}
+
+	start := 0
+	trimmed := make([]llm.Message, 0, len(history))
+	if history[0].Role == llm.RoleSystem {
+		trimmed = append(trimmed, history[0])
+		start = 1
+	}
+
+	cut := start
+	turns := 0
+	for i := len(history) - 1; i >= start; i-- {
+		if history[i].Role != llm.RoleUser {
+			continue
+		}
+		turns++
+		cut = i
+		if turns >= historyTurns {
+			break
+		}
+	}
+
+	trimmed = append(trimmed, history[cut:]...)
+	return trimmed
+}
+
+func shouldFlushTTS(text string, maxChars, minChars int) bool {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return false
 	}
-	last := []rune(text)[len([]rune(text))-1]
-	switch last {
-	case '。', '！', '？', '.', '!', '?', '；', ';', '，', ',':
+
+	runes := []rune(text)
+	if maxChars > 0 && len(runes) >= maxChars {
 		return true
 	}
-	return len([]rune(text)) >= maxChars
+
+	last := runes[len(runes)-1]
+	switch last {
+	case '。', '！', '？', '.', '!', '?':
+		return true
+	case '，', ',', '；', ';', '：', ':':
+		if minChars <= 0 {
+			return true
+		}
+		return len(runes) >= minChars
+	}
+	return false
 }

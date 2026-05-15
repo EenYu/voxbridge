@@ -32,6 +32,31 @@ func TestChunkSizeBytesClampsAndAlignsToL16Frames(t *testing.T) {
 	}
 }
 
+func TestBinaryChunkSizeBytesClampsAndAlignsToL16Frames(t *testing.T) {
+	tests := []struct {
+		name   string
+		target time.Duration
+		want   int
+	}{
+		{name: "default", target: 0, want: 640},
+		{name: "clamps low", target: 10 * time.Millisecond, want: 640},
+		{name: "keeps target", target: 80 * time.Millisecond, want: 2560},
+		{name: "clamps high", target: 500 * time.Millisecond, want: 3200},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BinaryChunkSizeBytes(16000, 1, 2, tt.target)
+			if got != tt.want {
+				t.Fatalf("BinaryChunkSizeBytes() = %d, want %d", got, tt.want)
+			}
+			if got%2 != 0 {
+				t.Fatalf("BinaryChunkSizeBytes() = %d, want L16 frame alignment", got)
+			}
+		})
+	}
+}
+
 func TestStreamAudioMessageBase64JSON(t *testing.T) {
 	pcm := []byte{0x00, 0x01, 0x02, 0xff}
 	encoded, err := json.Marshal(newStreamAudioMessage(16000, pcm))
