@@ -43,6 +43,7 @@ func run(logger *slog.Logger) error {
 		APIKey:  cfg.LLM.APIKey,
 		Model:   cfg.LLM.Model,
 		Timeout: cfg.LLM.Timeout,
+		Logger:  logger,
 	})
 	if err != nil {
 		return err
@@ -55,6 +56,7 @@ func run(logger *slog.Logger) error {
 		AccessKey:              volcAccessKey(cfg),
 		ResourceID:             firstNonEmpty(cfg.Volcengine.STTResourceID, cfg.Volcengine.ResourceID),
 		Cluster:                firstNonEmpty(cfg.Volcengine.STTCluster, cfg.Volcengine.Cluster),
+		ChunkSize:              cfg.Volcengine.STTChunkSize,
 		AsyncEndWindowSize:     cfg.Volcengine.STTAsyncEndWindowSize,
 		AsyncForceToSpeechTime: cfg.Volcengine.STTAsyncForceToSpeechTime,
 		Audio: volcengine.AudioConfig{

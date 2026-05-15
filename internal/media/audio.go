@@ -92,3 +92,10 @@ type clearAudioMessage struct {
 func newClearAudioMessage() clearAudioMessage {
 	return clearAudioMessage{Type: "clearAudio"}
 }
+
+func durationMillis(duration time.Duration) float64 {
+	if duration <= 0 {
+		return 0
+	}
+	return float64(duration) / float64(time.Millisecond)
+}

@@ -1,8 +1,10 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,8 +24,9 @@ type receivedWSMessage struct {
 func TestWebSocketAudioSenderStreamsRawBinaryPCMInWSBinaryMode(t *testing.T) {
 	conn, messages, cleanup := newTestWebSocketConn(t, 2)
 	defer cleanup()
+	var logs bytes.Buffer
 
-	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeWSBinary)
+	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeWSBinary, testLogger(&logs))
 	if err := sender.SendPCM(context.Background(), []byte{0, 1, 2, 3, 4, 5}); err != nil {
 		t.Fatalf("SendPCM() error = %v", err)
 	}
@@ -37,13 +40,21 @@ func TestWebSocketAudioSenderStreamsRawBinaryPCMInWSBinaryMode(t *testing.T) {
 	if second.messageType != websocket.BinaryMessage || string(second.payload) != string([]byte{4, 5}) {
 		t.Fatalf("second message = %#v", second)
 	}
+
+	assertFirstWebSocketWriteLog(t, logs.String(), map[string]string{
+		"playback_mode": "ws_binary",
+		"message_type":  "binary",
+		"chunk_bytes":   "4",
+		"chunk_ms":      "0.125",
+	})
 }
 
 func TestWebSocketAudioSenderUsesStreamAudioJSONInUUIDBroadcastMode(t *testing.T) {
 	conn, messages, cleanup := newTestWebSocketConn(t, 1)
 	defer cleanup()
+	var logs bytes.Buffer
 
-	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeUUIDBroadcast)
+	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeUUIDBroadcast, testLogger(&logs))
 	if err := sender.SendPCM(context.Background(), []byte{0, 1, 2, 3}); err != nil {
 		t.Fatalf("SendPCM() error = %v", err)
 	}
@@ -65,13 +76,21 @@ func TestWebSocketAudioSenderUsesStreamAudioJSONInUUIDBroadcastMode(t *testing.T
 	if got.Type != "streamAudio" || got.Data.SampleRate != 16000 {
 		t.Fatalf("message = %+v", got)
 	}
+
+	assertFirstWebSocketWriteLog(t, logs.String(), map[string]string{
+		"playback_mode": "uuid_broadcast",
+		"message_type":  "json",
+		"chunk_bytes":   "4",
+		"chunk_ms":      "0.125",
+	})
 }
 
 func TestWebSocketAudioSenderClearQueuedSendsClearAudioControl(t *testing.T) {
 	conn, messages, cleanup := newTestWebSocketConn(t, 1)
 	defer cleanup()
+	var logs bytes.Buffer
 
-	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeWSBinary)
+	sender := newWebSocketAudioSender(conn, 16000, 4, playback.ModeWSBinary, testLogger(&logs))
 	sender.ClearQueued()
 
 	msg := mustReceiveWSMessage(t, messages)
@@ -86,10 +105,13 @@ func TestWebSocketAudioSenderClearQueuedSendsClearAudioControl(t *testing.T) {
 	if got.Type != "clearAudio" {
 		t.Fatalf("clearAudio type = %q", got.Type)
 	}
+	if strings.Contains(logs.String(), "first_websocket_write") {
+		t.Fatalf("ClearQueued logged first_websocket_write; logs:\n%s", logs.String())
+	}
 }
 
 func TestWebSocketAudioSenderReserveWriteDelayPacesAndReset(t *testing.T) {
-	sender := newWebSocketAudioSender(nil, 10, 2, playback.ModeWSBinary)
+	sender := newWebSocketAudioSender(nil, 10, 2, playback.ModeWSBinary, nil)
 	base := time.Unix(0, 0)
 
 	if delay := sender.reserveWriteDelay(base, 2); delay != 0 {
@@ -164,5 +186,26 @@ func mustReceiveWSMessage(t *testing.T, messages <-chan receivedWSMessage) recei
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for websocket message")
 		return receivedWSMessage{}
+	}
+}
+
+func testLogger(out *bytes.Buffer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(out, nil))
+}
+
+func assertFirstWebSocketWriteLog(t *testing.T, logs string, fields map[string]string) {
+	t.Helper()
+
+	if count := strings.Count(logs, "msg=first_websocket_write"); count != 1 {
+		t.Fatalf("first_websocket_write log count = %d, want 1; logs:\n%s", count, logs)
+	}
+	if !strings.Contains(logs, "write_duration_ms=") {
+		t.Fatalf("logs missing write_duration_ms field:\n%s", logs)
+	}
+	for key, value := range fields {
+		want := key + "=" + value
+		if !strings.Contains(logs, want) {
+			t.Fatalf("logs missing %q:\n%s", want, logs)
+		}
 	}
 }

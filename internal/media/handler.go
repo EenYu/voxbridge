@@ -102,7 +102,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		)
 	}()
 
-	sender := newWebSocketAudioSender(conn, h.sampleRate(), h.chunkSize(), h.playbackMode())
+	sender := newWebSocketAudioSender(conn, h.sampleRate(), h.chunkSize(), h.playbackMode(), logger)
 	var session DialogSession
 	defer func() {
 		if session != nil {
@@ -343,21 +343,24 @@ func (s *inboundAudioStats) shouldLog(now time.Time) bool {
 }
 
 type webSocketAudioSender struct {
-	conn         *websocket.Conn
-	sampleRate   int
-	chunkSize    int
-	playbackMode playback.Mode
-	writeMu      sync.Mutex
-	paceMu       sync.Mutex
-	nextWriteAt  time.Time
+	conn                      *websocket.Conn
+	sampleRate                int
+	chunkSize                 int
+	playbackMode              playback.Mode
+	logger                    *slog.Logger
+	writeMu                   sync.Mutex
+	firstWebSocketWriteLogged bool
+	paceMu                    sync.Mutex
+	nextWriteAt               time.Time
 }
 
-func newWebSocketAudioSender(conn *websocket.Conn, sampleRate, chunkSize int, playbackMode playback.Mode) *webSocketAudioSender {
+func newWebSocketAudioSender(conn *websocket.Conn, sampleRate, chunkSize int, playbackMode playback.Mode, logger *slog.Logger) *webSocketAudioSender {
 	return &webSocketAudioSender{
 		conn:         conn,
 		sampleRate:   sampleRate,
 		chunkSize:    chunkSize,
 		playbackMode: playbackMode,
+		logger:       logger,
 	}
 }
 
@@ -368,7 +371,7 @@ func (s *webSocketAudioSender) SendPCM(ctx context.Context, pcm []byte) error {
 	if s.chunkSize <= 0 {
 		s.chunkSize = ChunkSizeBytes(s.sampleRate, DefaultChannels, DefaultBytesPerSample, DefaultChunkDuration)
 	}
-	paceWrites := playback.Normalize(s.playbackMode) == playback.ModeWSBinary
+	paceWrites := s.effectivePlaybackMode() == playback.ModeWSBinary
 
 	for start := 0; start < len(pcm); start += s.chunkSize {
 		if err := ctx.Err(); err != nil {
@@ -447,10 +450,51 @@ func (s *webSocketAudioSender) writePCMChunk(pcm []byte) error {
 	if s.conn == nil {
 		return errors.New("websocket connection is nil")
 	}
-	if playback.Normalize(s.playbackMode) == playback.ModeUUIDBroadcast {
-		return s.conn.WriteJSON(newStreamAudioMessage(s.sampleRate, pcm))
+
+	messageType := "binary"
+	start := time.Now()
+	var err error
+	if s.effectivePlaybackMode() == playback.ModeUUIDBroadcast {
+		messageType = "json"
+		err = s.conn.WriteJSON(newStreamAudioMessage(s.sampleRate, pcm))
+	} else {
+		err = s.conn.WriteMessage(websocket.BinaryMessage, pcm)
 	}
-	return s.conn.WriteMessage(websocket.BinaryMessage, pcm)
+	writeDuration := time.Since(start)
+	if err != nil {
+		return err
+	}
+	s.observeWebSocketPCMWrite(messageType, len(pcm), writeDuration)
+	return nil
+}
+
+func (s *webSocketAudioSender) observeWebSocketPCMWrite(messageType string, chunkBytes int, writeDuration time.Duration) {
+	if s.firstWebSocketWriteLogged {
+		return
+	}
+	s.firstWebSocketWriteLogged = true
+	s.loggerOrDefault().Info(
+		"first_websocket_write",
+		"playback_mode", string(s.effectivePlaybackMode()),
+		"message_type", messageType,
+		"chunk_bytes", chunkBytes,
+		"chunk_ms", durationMillis(pcmChunkDuration(s.sampleRate, chunkBytes)),
+		"write_duration_ms", durationMillis(writeDuration),
+	)
+}
+
+func (s *webSocketAudioSender) effectivePlaybackMode() playback.Mode {
+	if playback.Normalize(s.playbackMode) == playback.ModeUUIDBroadcast {
+		return playback.ModeUUIDBroadcast
+	}
+	return playback.ModeWSBinary
+}
+
+func (s *webSocketAudioSender) loggerOrDefault() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 func pcmChunkDuration(sampleRate, bytes int) time.Duration {

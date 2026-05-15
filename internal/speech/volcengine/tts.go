@@ -73,13 +73,17 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 	)
 	dialCtx, cancel := context.WithTimeout(ctx, p.cfg.Timeout)
 	defer cancel()
+	connectStarted := time.Now()
 	conn, resp, err := p.cfg.dialer.DialContext(dialCtx, p.cfg.Endpoint, authHeaders(p.cfg.AppID, p.cfg.Token, p.cfg.AccessKey, p.cfg.ResourceID, requestID))
 	if err != nil {
-		logger.Warn("volcengine tts connect failed", "error", err)
+		logger.Warn("volcengine tts connect failed", "error", err, "connect_ms", time.Since(connectStarted).Milliseconds())
 		return websocketDialError("connect volcengine TTS websocket", resp, err)
 	}
 	defer conn.Close()
-	logger.Info("volcengine tts connected", "endpoint", p.cfg.Endpoint)
+	logger.Info("volcengine tts connected",
+		"endpoint", p.cfg.Endpoint,
+		"connect_ms", time.Since(connectStarted).Milliseconds(),
+	)
 
 	startConnectionPayload := []byte("{}")
 	if err := p.sendTTSEvent(ctx, conn, ttsEventStartConnection, "", startConnectionPayload, serializationNone); err != nil {
@@ -92,6 +96,7 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 
 	sessionID := newRequestID()
 	startSessionPayload := p.ttsPayload(requestID, ttsEventStartSession, "", sessionID)
+	sessionStartRequested := time.Now()
 	if err := p.sendTTSEvent(ctx, conn, ttsEventStartSession, sessionID, startSessionPayload, serializationJSON); err != nil {
 		return err
 	}
@@ -99,10 +104,15 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 	if err := p.expectTTSEvent(ctx, conn, ttsEventSessionStart, logger); err != nil {
 		return err
 	}
+	logger.Info("volcengine tts session started",
+		"session_id", sessionID,
+		"session_start_ms", time.Since(sessionStartRequested).Milliseconds(),
+	)
 	taskPayload := p.ttsPayload(requestID, ttsEventTaskRequest, text, sessionID)
 	if err := p.sendTTSEvent(ctx, conn, ttsEventTaskRequest, sessionID, taskPayload, serializationJSON); err != nil {
 		return err
 	}
+	taskSentAt := time.Now()
 	logTTSEventSent(logger, ttsEventTaskRequest, sessionID, taskPayload, serializationJSON)
 	logger.Info("volcengine tts task sent",
 		"session_id", sessionID,
@@ -118,6 +128,7 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 	var responseFrames int64
 	var audioChunks int64
 	var audioBytes int64
+	var firstAudioBytes int
 	for {
 		resp, err := p.readTTSResponse(ctx, conn)
 		if err != nil {
@@ -137,6 +148,15 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 				chunk := append([]byte(nil), resp.payload...)
 				audioChunks++
 				audioBytes += int64(len(chunk))
+				if firstAudioBytes == 0 {
+					firstAudioBytes = len(chunk)
+					logger.Info("volcengine tts first audio",
+						"session_id", sessionID,
+						"task_to_first_audio_ms", time.Since(taskSentAt).Milliseconds(),
+						"first_audio_bytes", firstAudioBytes,
+						"response_frame", responseFrames,
+					)
+				}
 				if audioChunks <= 3 || audioChunks%20 == 0 {
 					logger.Info("volcengine tts audio chunk",
 						"session_id", sessionID,
@@ -167,6 +187,7 @@ func (p *TTSProvider) synthesize(ctx context.Context, text string, audioCh chan<
 					"response_frames", responseFrames,
 					"audio_chunks", audioChunks,
 					"audio_bytes", audioBytes,
+					"first_audio_bytes", firstAudioBytes,
 				)
 				return nil
 			case ttsEventSessionFail, ttsEventConnectionFail:

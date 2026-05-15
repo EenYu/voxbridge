@@ -1,8 +1,10 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,5 +159,45 @@ func TestOpenAIClientStreamChatReportsHTTPError(t *testing.T) {
 	}
 	if gotErr == nil || !strings.Contains(gotErr.Error(), "status 401") {
 		t.Fatalf("error = %v, want status 401", gotErr)
+	}
+}
+
+func TestOpenAIClientStreamChatLogsTimingsWithoutContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"private-delta-content\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	var logs bytes.Buffer
+	client, err := NewOpenAICompatibleClient(OpenAIOptions{
+		BaseURL:    server.URL,
+		Model:      "gpt-test",
+		HTTPClient: server.Client(),
+		Logger:     slog.New(slog.NewJSONHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAICompatibleClient() error = %v", err)
+	}
+
+	deltas, errs := client.StreamChat(context.Background(), []Message{{Role: RoleUser, Content: "private-user-content"}})
+	for range deltas {
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("StreamChat() error = %v", err)
+		}
+	}
+
+	gotLogs := logs.String()
+	if !strings.Contains(gotLogs, "request_to_headers_ms") {
+		t.Fatalf("logs missing request_to_headers_ms: %s", gotLogs)
+	}
+	if !strings.Contains(gotLogs, "request_to_first_delta_ms") {
+		t.Fatalf("logs missing request_to_first_delta_ms: %s", gotLogs)
+	}
+	if strings.Contains(gotLogs, "private-user-content") || strings.Contains(gotLogs, "private-delta-content") {
+		t.Fatalf("logs leaked request or response content: %s", gotLogs)
 	}
 }

@@ -1,7 +1,10 @@
 package dialog
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -96,6 +99,103 @@ func (s *recordingSender) ClearQueued() {
 	s.clears++
 }
 
+type blockingClearSender struct {
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (s *blockingClearSender) SendPCM(context.Context, []byte) error { return nil }
+
+func (s *blockingClearSender) ClearQueued() {
+	s.startOnce.Do(func() {
+		close(s.started)
+	})
+	<-s.release
+}
+
+func (s *blockingClearSender) Release() {
+	s.releaseOnce.Do(func() {
+		close(s.release)
+	})
+}
+
+type startedLLM struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *startedLLM) StreamChat(ctx context.Context, _ []llm.Message) (<-chan llm.Delta, <-chan error) {
+	deltas := make(chan llm.Delta)
+	errs := make(chan error)
+	s.once.Do(func() {
+		close(s.started)
+	})
+	go func() {
+		defer close(deltas)
+		defer close(errs)
+		select {
+		case <-ctx.Done():
+		case deltas <- llm.Delta{Done: true}:
+		}
+	}()
+	return deltas, errs
+}
+
+type channelSender struct {
+	sent chan []byte
+}
+
+func (s *channelSender) SendPCM(ctx context.Context, pcm []byte) error {
+	out := append([]byte(nil), pcm...)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.sent <- out:
+		return nil
+	}
+}
+
+func (s *channelSender) ClearQueued() {}
+
+type holdingChunkTTS struct {
+	chunk []byte
+}
+
+func (t *holdingChunkTTS) Synthesize(ctx context.Context, _ string) (<-chan []byte, <-chan error) {
+	chunks := make(chan []byte)
+	errs := make(chan error)
+	go func() {
+		defer close(chunks)
+		defer close(errs)
+		select {
+		case <-ctx.Done():
+			return
+		case chunks <- append([]byte(nil), t.chunk...):
+		}
+		<-ctx.Done()
+	}()
+	return chunks, errs
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *lockedBuffer) BytesCopy() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.Buffer.Bytes()...)
+}
+
 func TestSessionCancelsActiveResponseOnBargeIn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,8 +229,43 @@ func TestSessionCancelsActiveResponseOnBargeIn(t *testing.T) {
 	eventually(t, time.Second, func() bool {
 		sender.mu.Lock()
 		defer sender.mu.Unlock()
-		return sender.clears >= 2
+		return sender.clears >= 1
 	})
+}
+
+func TestBlockingClearQueuedDoesNotBlockFinalTurnLLM(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stt := &fakeSTTProvider{}
+	chat := &startedLLM{started: make(chan struct{})}
+	tts := &recordingTTS{}
+	sender := &blockingClearSender{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer sender.Release()
+
+	session, err := NewSession(ctx, "call-1", stt, tts, chat, sender, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	stt.session.events <- speech.RecognitionEvent{Kind: speech.RecognitionFinal, Text: "开始"}
+
+	select {
+	case <-chat.started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("blocking ClearQueued should not block LLM start")
+	}
+
+	sender.Release()
+	select {
+	case <-sender.started:
+	case <-time.After(time.Second):
+		t.Fatal("expected ClearQueued to be scheduled")
+	}
 }
 
 type scriptedLLM struct {
@@ -207,6 +342,83 @@ func TestSessionStreamsFinalRecognitionThroughLLMAndTTS(t *testing.T) {
 		defer tts.mu.Unlock()
 		return len(tts.texts) > 0 && tts.texts[0] == "好的，马上处理。"
 	})
+}
+
+func TestRecognitionFinalUsesEventTimeInTurnSummary(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var logs lockedBuffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	asrFinalAt := time.Now().Add(-250 * time.Millisecond)
+	stt := &fakeSTTProvider{}
+	chat := &scriptedLLM{deltas: []llm.Delta{
+		{Content: "好。", Done: true},
+	}}
+	tts := &recordingTTS{}
+	sender := &recordingSender{}
+
+	session, err := NewSession(ctx, "call-1", stt, tts, chat, sender, Options{
+		MaxTTSChars: 40,
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	stt.session.events <- speech.RecognitionEvent{
+		Kind:       speech.RecognitionFinal,
+		Text:       "开始",
+		ReceivedAt: asrFinalAt,
+	}
+
+	eventually(t, time.Second, func() bool {
+		return bytes.Contains(logs.BytesCopy(), []byte(`"msg":"turn latency summary"`))
+	})
+	summary := findLogRecord(t, logs.BytesCopy(), "turn latency summary")
+	newField := int64LogAttr(t, summary, "asr_final_to_llm_first_token_ms")
+	compatField := int64LogAttr(t, summary, "final_asr_to_llm_first_token_ms")
+	if newField < 150 {
+		t.Fatalf("asr_final_to_llm_first_token_ms = %d, want event-time based latency", newField)
+	}
+	if compatField != newField {
+		t.Fatalf("final_asr_to_llm_first_token_ms = %d, want %d", compatField, newField)
+	}
+}
+
+func TestFirstTTSPlaybackChunkUsesTwentyMSBuffer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stt := &fakeSTTProvider{}
+	chat := &scriptedLLM{deltas: []llm.Delta{
+		{Content: "好。", Done: true},
+	}}
+	tts := &holdingChunkTTS{
+		chunk: bytes.Repeat([]byte{0, 1}, defaultFirstTTSPlaybackChunkSize/2),
+	}
+	sender := &channelSender{sent: make(chan []byte, 1)}
+
+	session, err := NewSession(ctx, "call-1", stt, tts, chat, sender, Options{MaxTTSChars: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	stt.session.events <- speech.RecognitionEvent{Kind: speech.RecognitionFinal, Text: "开始"}
+
+	select {
+	case pcm := <-sender.sent:
+		if len(pcm) != defaultFirstTTSPlaybackChunkSize {
+			t.Fatalf("first SendPCM bytes = %d, want %d", len(pcm), defaultFirstTTSPlaybackChunkSize)
+		}
+		if len(pcm)%2 != 0 {
+			t.Fatalf("first SendPCM bytes = %d, want even PCM16 length", len(pcm))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected first 20ms PCM chunk before TTS stream finished")
+	}
 }
 
 type signalingLLM struct {
@@ -361,7 +573,7 @@ func TestTrimHistoryKeepsSystemPromptAndRecentUserTurns(t *testing.T) {
 }
 
 func TestTurnMetricsMarkersAreIdempotent(t *testing.T) {
-	turn := newTurnMetrics(1)
+	turn := newTurnMetrics(1, time.Now())
 
 	if !turn.markLLMFirstToken() || turn.markLLMFirstToken() {
 		t.Fatal("markLLMFirstToken should only succeed once")
@@ -375,6 +587,47 @@ func TestTurnMetricsMarkersAreIdempotent(t *testing.T) {
 	if !turn.markFirstPlaybackQueued() || turn.markFirstPlaybackQueued() {
 		t.Fatal("markFirstPlaybackQueued should only succeed once")
 	}
+}
+
+func TestTurnMetricsDefaultsMissingASRFinalTime(t *testing.T) {
+	before := time.Now()
+	turn := newTurnMetrics(1, time.Time{})
+	after := time.Now()
+
+	if turn.asrFinalAt.IsZero() {
+		t.Fatal("asrFinalAt should default when missing")
+	}
+	if turn.asrFinalAt.Before(before) || turn.asrFinalAt.After(after) {
+		t.Fatalf("asrFinalAt = %v, want between %v and %v", turn.asrFinalAt, before, after)
+	}
+}
+
+func findLogRecord(t *testing.T, data []byte, msg string) map[string]any {
+	t.Helper()
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("unmarshal log record: %v\n%s", err, line)
+		}
+		if record["msg"] == msg {
+			return record
+		}
+	}
+	t.Fatalf("log record %q not found in:\n%s", msg, data)
+	return nil
+}
+
+func int64LogAttr(t *testing.T, record map[string]any, key string) int64 {
+	t.Helper()
+	value, ok := record[key]
+	if !ok {
+		t.Fatalf("log attr %q not found in %#v", key, record)
+	}
+	number, ok := value.(float64)
+	if !ok {
+		t.Fatalf("log attr %q = %#v, want number", key, value)
+	}
+	return int64(number)
 }
 
 func eventually(t *testing.T, timeout time.Duration, fn func() bool) {

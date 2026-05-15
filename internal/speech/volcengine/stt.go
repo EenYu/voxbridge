@@ -394,7 +394,12 @@ func (s *sttSession) readLoop() {
 			}
 			return
 		}
+		receivedAt := time.Now()
+		audioBytes := s.audioBytes.Load()
 		for _, ev := range events {
+			ev.ReceivedAt = receivedAt
+			ev.FrameIndex = frames
+			ev.AudioBytes = audioBytes
 			if !s.shouldEmitRecognitionEvent(ev) {
 				continue
 			}
@@ -488,6 +493,9 @@ func (s *sttSession) logRecognitionEvent(ev speech.RecognitionEvent) {
 	s.logger.Info("volcengine stt recognition event",
 		"kind", kind,
 		"index", count,
+		"received_at", ev.ReceivedAt,
+		"frame_index", ev.FrameIndex,
+		"audio_bytes", ev.AudioBytes,
 		"chars", len([]rune(ev.Text)),
 		"text", textPreview(ev.Text, 120),
 	)

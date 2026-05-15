@@ -20,6 +20,7 @@ const (
 	defaultLLMTimeout                = 60 * time.Second
 	defaultESLTimeout                = 5 * time.Second
 	defaultSpeechTimeout             = 30 * time.Second
+	defaultSTTChunkSize              = 3200
 	defaultSTTAsyncEndWindowSize     = 600
 	defaultSTTAsyncForceToSpeechTime = 800
 )
@@ -67,6 +68,7 @@ type VolcengineConfig struct {
 	STTEndpoint               string
 	STTResourceID             string
 	STTCluster                string
+	STTChunkSize              int
 	TTSEndpoint               string
 	TTSResourceID             string
 	TTSCluster                string
@@ -125,6 +127,7 @@ func LoadFromEnv(lookup func(string) (string, bool)) (Config, error) {
 			STTEndpoint:               get(lookup, "VOXBRIDGE_VOLCENGINE_STT_ENDPOINT"),
 			STTResourceID:             get(lookup, "VOXBRIDGE_VOLCENGINE_STT_RESOURCE_ID"),
 			STTCluster:                get(lookup, "VOXBRIDGE_VOLCENGINE_STT_CLUSTER"),
+			STTChunkSize:              integer(lookup, "VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE", defaultSTTChunkSize),
 			TTSEndpoint:               get(lookup, "VOXBRIDGE_VOLCENGINE_TTS_ENDPOINT"),
 			TTSResourceID:             get(lookup, "VOXBRIDGE_VOLCENGINE_TTS_RESOURCE_ID"),
 			TTSCluster:                get(lookup, "VOXBRIDGE_VOLCENGINE_TTS_CLUSTER"),
@@ -174,6 +177,7 @@ func (c Config) Validate() error {
 	validatePlaybackMode(&errs, "VOXBRIDGE_PLAYBACK_MODE", c.PlaybackMode)
 	validateOptionalWebSocketURL(&errs, "VOXBRIDGE_VOLCENGINE_STT_ENDPOINT", c.Volcengine.STTEndpoint)
 	validateOptionalWebSocketURL(&errs, "VOXBRIDGE_VOLCENGINE_TTS_ENDPOINT", c.Volcengine.TTSEndpoint)
+	positiveInt(&errs, "VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE", c.Volcengine.STTChunkSize)
 	positiveInt(&errs, "VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE", c.Volcengine.STTAsyncEndWindowSize)
 	positiveInt(&errs, "VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME", c.Volcengine.STTAsyncForceToSpeechTime)
 	positiveDuration(&errs, "VOXBRIDGE_LLM_TIMEOUT", c.LLM.Timeout)

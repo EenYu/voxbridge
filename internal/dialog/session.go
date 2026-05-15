@@ -15,12 +15,14 @@ import (
 )
 
 const (
-	defaultSystemPrompt         = "你是一名简洁、礼貌、可靠的中文电话助手。回答要短，优先直接解决来电者的问题。"
-	defaultHistoryTurns         = 6
-	defaultMaxTTSChars          = 80
-	defaultMinTTSChars          = 12
-	defaultTTSPlaybackChunkMS   = 100
-	defaultTTSPlaybackChunkSize = 16000 * 2 * defaultTTSPlaybackChunkMS / 1000
+	defaultSystemPrompt                   = "你是一名简洁、礼貌、可靠的中文电话助手。回答要短，优先直接解决来电者的问题。"
+	defaultHistoryTurns                   = 6
+	defaultMaxTTSChars                    = 80
+	defaultMinTTSChars                    = 12
+	defaultFirstTTSPlaybackChunkMS        = 20
+	defaultSubsequentTTSPlaybackChunkMS   = 100
+	defaultFirstTTSPlaybackChunkSize      = 16000 * 2 * defaultFirstTTSPlaybackChunkMS / 1000
+	defaultSubsequentTTSPlaybackChunkSize = 16000 * 2 * defaultSubsequentTTSPlaybackChunkMS / 1000
 )
 
 type Options struct {
@@ -49,6 +51,10 @@ type Session struct {
 	closed         bool
 	responseSerial int64
 	partialEvents  int
+
+	clearQueuedRequests  uint64
+	clearQueuedProcessed uint64
+	clearQueuedRunning   bool
 }
 
 func NewSession(ctx context.Context, id string, sttProvider speech.STTProvider, tts speech.TTSProvider, chat llm.Client, sender AudioSender, opts Options) (*Session, error) {
@@ -168,16 +174,20 @@ func (s *Session) handleRecognition(ev speech.RecognitionEvent) {
 		s.cancelActiveLocked()
 		s.mu.Unlock()
 	case speech.RecognitionFinal:
+		asrFinalAt := ev.ReceivedAt
+		if asrFinalAt.IsZero() {
+			asrFinalAt = time.Now()
+		}
 		s.opts.Logger.Info("recognized final speech",
 			"session", s.id,
 			"chars", len([]rune(text)),
 			"text", previewText(text, 200),
 		)
-		s.startUserTurn(text)
+		s.startUserTurn(text, asrFinalAt)
 	}
 }
 
-func (s *Session) startUserTurn(text string) {
+func (s *Session) startUserTurn(text string, asrFinalAt time.Time) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -194,7 +204,7 @@ func (s *Session) startUserTurn(text string) {
 	s.activeDone = done
 	s.mu.Unlock()
 
-	go s.runAssistant(ctx, serial, messages, done)
+	go s.runAssistant(ctx, serial, messages, done, asrFinalAt)
 }
 
 func (s *Session) cancelActiveLocked() {
@@ -202,11 +212,35 @@ func (s *Session) cancelActiveLocked() {
 		s.activeCancel()
 		s.activeCancel = nil
 	}
-	s.sender.ClearQueued()
+	s.scheduleClearQueuedLocked()
 }
 
-func (s *Session) runAssistant(ctx context.Context, serial int64, messages []llm.Message, done chan struct{}) {
-	turn := newTurnMetrics(serial)
+func (s *Session) scheduleClearQueuedLocked() {
+	s.clearQueuedRequests++
+	if s.clearQueuedRunning {
+		return
+	}
+	s.clearQueuedRunning = true
+	go s.clearQueuedAsync()
+}
+
+func (s *Session) clearQueuedAsync() {
+	for {
+		s.mu.Lock()
+		if s.clearQueuedProcessed >= s.clearQueuedRequests {
+			s.clearQueuedRunning = false
+			s.mu.Unlock()
+			return
+		}
+		s.clearQueuedProcessed = s.clearQueuedRequests
+		s.mu.Unlock()
+
+		s.sender.ClearQueued()
+	}
+}
+
+func (s *Session) runAssistant(ctx context.Context, serial int64, messages []llm.Message, done chan struct{}, asrFinalAt time.Time) {
+	turn := newTurnMetrics(serial, asrFinalAt)
 	ctx, cancelPipeline := context.WithCancel(ctx)
 	defer cancelPipeline()
 	defer close(done)
@@ -362,6 +396,7 @@ func (s *Session) runAssistant(ctx context.Context, serial int64, messages []llm
 func (s *Session) runTTSWorker(ctx context.Context, turn *turnMetrics, textQueue <-chan string, pcmQueue chan<- []byte, done chan<- error) {
 	defer close(pcmQueue)
 	fragmentID := 0
+	firstPlaybackChunk := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -373,7 +408,7 @@ func (s *Session) runTTSWorker(ctx context.Context, turn *turnMetrics, textQueue
 				return
 			}
 			fragmentID++
-			if err := s.synthesizeToPCMChunks(ctx, turn, fragmentID, text, pcmQueue); err != nil {
+			if err := s.synthesizeToPCMChunks(ctx, turn, fragmentID, text, pcmQueue, &firstPlaybackChunk); err != nil {
 				done <- err
 				return
 			}
@@ -426,7 +461,7 @@ func (s *Session) runPlaybackWorker(ctx context.Context, turn *turnMetrics, pcmQ
 	}
 }
 
-func (s *Session) synthesizeToPCMChunks(ctx context.Context, turn *turnMetrics, fragmentID int, text string, out chan<- []byte) error {
+func (s *Session) synthesizeToPCMChunks(ctx context.Context, turn *turnMetrics, fragmentID int, text string, out chan<- []byte, firstPlaybackChunk *bool) error {
 	s.opts.Logger.Info("tts synthesize requested",
 		"session", s.id,
 		"turn_id", turn.id,
@@ -440,8 +475,15 @@ func (s *Session) synthesizeToPCMChunks(ctx context.Context, turn *turnMetrics, 
 	byteCount := 0
 	var audio bytes.Buffer
 	flushAudio := func(final bool) error {
-		for audio.Len() >= defaultTTSPlaybackChunkSize || final && audio.Len() > 0 {
-			n := defaultTTSPlaybackChunkSize
+		for {
+			targetSize := defaultSubsequentTTSPlaybackChunkSize
+			if firstPlaybackChunk != nil && *firstPlaybackChunk {
+				targetSize = defaultFirstTTSPlaybackChunkSize
+			}
+			if audio.Len() < targetSize && !(final && audio.Len() > 0) {
+				return nil
+			}
+			n := targetSize
 			if audio.Len() < n {
 				n = audio.Len()
 			}
@@ -454,8 +496,10 @@ func (s *Session) synthesizeToPCMChunks(ctx context.Context, turn *turnMetrics, 
 				return ctx.Err()
 			case out <- pcm:
 			}
+			if firstPlaybackChunk != nil {
+				*firstPlaybackChunk = false
+			}
 		}
-		return nil
 	}
 	for chunks != nil || errs != nil {
 		select {
@@ -552,8 +596,8 @@ func waitPipeline(ctx context.Context, cancel context.CancelFunc, ttsDone, playb
 }
 
 type turnMetrics struct {
-	id    int64
-	start time.Time
+	id         int64
+	asrFinalAt time.Time
 
 	mu                    sync.Mutex
 	llmFirstTokenMS       int64
@@ -566,10 +610,13 @@ type turnMetrics struct {
 	playbackBytes         int
 }
 
-func newTurnMetrics(id int64) *turnMetrics {
+func newTurnMetrics(id int64, asrFinalAt time.Time) *turnMetrics {
+	if asrFinalAt.IsZero() {
+		asrFinalAt = time.Now()
+	}
 	return &turnMetrics{
 		id:                    id,
-		start:                 time.Now(),
+		asrFinalAt:            asrFinalAt,
 		llmFirstTokenMS:       -1,
 		firstFragmentMS:       -1,
 		ttsFirstAudioMS:       -1,
@@ -578,7 +625,7 @@ func newTurnMetrics(id int64) *turnMetrics {
 }
 
 func (m *turnMetrics) elapsedMS() int64 {
-	return time.Since(m.start).Milliseconds()
+	return time.Since(m.asrFinalAt).Milliseconds()
 }
 
 func (m *turnMetrics) markLLMFirstToken() bool {
@@ -653,6 +700,10 @@ func (m *turnMetrics) logSummary(logger *slog.Logger, sessionID string) {
 		"session", sessionID,
 		"turn_id", m.id,
 		"elapsed_ms", m.elapsedMS(),
+		"asr_final_to_llm_first_token_ms", llmFirstTokenMS,
+		"asr_final_to_first_tts_fragment_ms", firstFragmentMS,
+		"asr_final_to_tts_first_audio_ms", ttsFirstAudioMS,
+		"asr_final_to_playback_queued_ms", firstPlaybackQueuedMS,
 		"final_asr_to_llm_first_token_ms", llmFirstTokenMS,
 		"final_asr_to_first_tts_fragment_ms", firstFragmentMS,
 		"final_asr_to_tts_first_audio_ms", ttsFirstAudioMS,

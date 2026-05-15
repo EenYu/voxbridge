@@ -1,6 +1,9 @@
 package speech
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type RecognitionKind int
 
@@ -10,8 +13,11 @@ const (
 )
 
 type RecognitionEvent struct {
-	Kind RecognitionKind
-	Text string
+	Kind       RecognitionKind
+	Text       string
+	ReceivedAt time.Time
+	FrameIndex int64
+	AudioBytes int64
 }
 
 type STTSession interface {

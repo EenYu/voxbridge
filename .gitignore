@@ -5,6 +5,7 @@
 bin/
 dist/
 build/
+/voxbridge
 __pycache__/
 *.pyc
 *.test

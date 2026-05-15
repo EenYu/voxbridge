@@ -122,3 +122,12 @@ func TestParseTextEventStartsOnPlainMetadataUUID(t *testing.T) {
 		t.Fatalf("CallUUID = %q, want call-456", event.CallUUID)
 	}
 }
+
+func TestDurationMillisPreservesSubMillisecondPrecision(t *testing.T) {
+	if got := durationMillis(125 * time.Microsecond); got != 0.125 {
+		t.Fatalf("durationMillis() = %v, want 0.125", got)
+	}
+	if got := durationMillis(-time.Millisecond); got != 0 {
+		t.Fatalf("durationMillis() = %v, want 0 for negative duration", got)
+	}
+}

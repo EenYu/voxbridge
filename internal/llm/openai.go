@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ type OpenAIOptions struct {
 	Model      string
 	HTTPClient *http.Client
 	Timeout    time.Duration
+	Logger     *slog.Logger
 }
 
 type OpenAIClient struct {
@@ -26,6 +28,7 @@ type OpenAIClient struct {
 	apiKey     string
 	model      string
 	httpClient *http.Client
+	logger     *slog.Logger
 }
 
 func NewOpenAICompatibleClient(opts OpenAIOptions) (*OpenAIClient, error) {
@@ -44,12 +47,18 @@ func NewOpenAICompatibleClient(opts OpenAIOptions) (*OpenAIClient, error) {
 		}
 		httpClient = &http.Client{Timeout: timeout}
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	model := strings.TrimSpace(opts.Model)
 
 	return &OpenAIClient{
 		baseURL:    strings.TrimRight(opts.BaseURL, "/"),
 		apiKey:     strings.TrimSpace(opts.APIKey),
-		model:      strings.TrimSpace(opts.Model),
+		model:      model,
 		httpClient: httpClient,
+		logger:     logger.With("provider", "openai_compatible", "component", "llm", "model", model),
 	}, nil
 }
 
@@ -78,6 +87,7 @@ func (c *OpenAIClient) StreamChat(ctx context.Context, messages []Message) (<-ch
 }
 
 func (c *OpenAIClient) streamChat(ctx context.Context, messages []Message, emit func(Delta) error) error {
+	requestStarted := time.Now()
 	body, err := json.Marshal(chatCompletionRequest{
 		Model:    c.model,
 		Messages: messages,
@@ -102,13 +112,38 @@ func (c *OpenAIClient) streamChat(ctx context.Context, messages []Message, emit 
 		return fmt.Errorf("send chat completion request: %w", err)
 	}
 	defer resp.Body.Close()
+	headersAt := time.Now()
+	c.logger.Info("openai llm stream response headers",
+		"request_to_headers_ms", headersAt.Sub(requestStarted).Milliseconds(),
+		"status", resp.StatusCode,
+		"messages", len(messages),
+		"request_bytes", len(body),
+	)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("chat completion request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 
-	return parseChatCompletionSSE(resp.Body, emit)
+	firstDeltaLogged := false
+	if err := parseChatCompletionSSE(resp.Body, func(delta Delta) error {
+		if !firstDeltaLogged {
+			firstDeltaLogged = true
+			c.logger.Info("openai llm stream first delta",
+				"request_to_first_delta_ms", time.Since(requestStarted).Milliseconds(),
+				"delta_chars", len([]rune(delta.Content)),
+				"delta_done", delta.Done,
+			)
+		}
+		return emit(delta)
+	}); err != nil {
+		return err
+	}
+	c.logger.Info("openai llm stream completed",
+		"request_to_complete_ms", time.Since(requestStarted).Milliseconds(),
+		"first_delta", firstDeltaLogged,
+	)
+	return nil
 }
 
 type chatCompletionRequest struct {

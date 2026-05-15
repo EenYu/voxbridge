@@ -35,18 +35,28 @@ export VOXBRIDGE_VOLCENGINE_RESOURCE_ID=YOUR_RESOURCE_ID
 export VOXBRIDGE_VOLCENGINE_TTS_VOICE_TYPE=zh_female_wanwanxiaohe_moon_bigtts
 ```
 
-Optional Volcengine overrides:
+Recommended low-risk pilot Volcengine overrides:
 
 ```bash
-export VOXBRIDGE_VOLCENGINE_STT_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+export VOXBRIDGE_VOLCENGINE_STT_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 export VOXBRIDGE_VOLCENGINE_TTS_ENDPOINT=wss://openspeech.bytedance.com/api/v3/tts/bidirection
 export VOXBRIDGE_VOLCENGINE_STT_RESOURCE_ID=...
 export VOXBRIDGE_VOLCENGINE_TTS_RESOURCE_ID=...
 export VOXBRIDGE_VOLCENGINE_STT_CLUSTER=...
 export VOXBRIDGE_VOLCENGINE_TTS_CLUSTER=...
-export VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE=600
-export VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME=800
+export VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE=3200
+export VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE=400
+export VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME=700
 ```
+
+For the pilot, keep `VOXBRIDGE_PLAYBACK_MODE=ws_binary` and use the Volcengine
+`bigmodel_async` STT endpoint. Keep STT chunk size at `3200` unless the test is
+explicitly about chunking; this preserves the previous default.
+
+Use a small A/B for async sentence-boundary tuning:
+
+- A: `VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE=400` and `VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME=700`
+- B: `VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE=300` and `VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME=600`
 
 The async STT sentence-boundary settings are used only when the STT endpoint is
 the Volcengine `bigmodel_async` endpoint. Non-async STT endpoints keep the

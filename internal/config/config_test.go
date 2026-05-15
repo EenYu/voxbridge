@@ -28,6 +28,7 @@ func TestLoadFromEnvValidatesAndAppliesDefaults(t *testing.T) {
 		"VOXBRIDGE_AUDIO_CHANNELS":                            "1",
 		"VOXBRIDGE_AUDIO_FRAME_MS":                            "40",
 		"VOXBRIDGE_AUDIO_CODEC":                               "pcm_s16le",
+		"VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE":                 "1600",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE":      "700",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME": "900",
 	}
@@ -48,6 +49,9 @@ func TestLoadFromEnvValidatesAndAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Audio.SampleRateHz != 8000 || cfg.Audio.FrameMS != 40 {
 		t.Fatalf("audio config = %+v", cfg.Audio)
+	}
+	if cfg.Volcengine.STTChunkSize != 1600 {
+		t.Fatalf("STT chunk size = %d", cfg.Volcengine.STTChunkSize)
 	}
 	if cfg.Volcengine.STTAsyncEndWindowSize != 700 {
 		t.Fatalf("STT async end window size = %d", cfg.Volcengine.STTAsyncEndWindowSize)
@@ -91,6 +95,9 @@ func TestLoadFromEnvDefaultsOptionalAudioAndTimeouts(t *testing.T) {
 	if cfg.LLM.Timeout != defaultLLMTimeout {
 		t.Fatalf("LLM timeout = %s", cfg.LLM.Timeout)
 	}
+	if cfg.Volcengine.STTChunkSize != defaultSTTChunkSize {
+		t.Fatalf("STT chunk size = %d", cfg.Volcengine.STTChunkSize)
+	}
 	if cfg.Volcengine.STTAsyncEndWindowSize != defaultSTTAsyncEndWindowSize {
 		t.Fatalf("STT async end window size = %d", cfg.Volcengine.STTAsyncEndWindowSize)
 	}
@@ -133,6 +140,7 @@ func TestLoadFromEnvReturnsValidationErrors(t *testing.T) {
 		"VOXBRIDGE_LLM_BASE_URL":                              "ftp://example.com",
 		"VOXBRIDGE_AUDIO_SAMPLE_RATE_HZ":                      "-1",
 		"VOXBRIDGE_LLM_TIMEOUT":                               "bad-duration",
+		"VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE":                 "0",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE":      "0",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME": "-1",
 	}
@@ -152,6 +160,7 @@ func TestLoadFromEnvReturnsValidationErrors(t *testing.T) {
 		"VOXBRIDGE_LLM_BASE_URL must use http or https",
 		"VOXBRIDGE_AUDIO_SAMPLE_RATE_HZ must be positive",
 		"VOXBRIDGE_LLM_TIMEOUT must be a positive duration",
+		"VOXBRIDGE_VOLCENGINE_STT_CHUNK_SIZE must be positive",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_END_WINDOW_SIZE must be positive",
 		"VOXBRIDGE_VOLCENGINE_STT_ASYNC_FORCE_TO_SPEECH_TIME must be positive",
 	} {
